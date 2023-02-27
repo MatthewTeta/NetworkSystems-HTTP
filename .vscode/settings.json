@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "string.h": "c",
+        "netdb.h": "c"
+    },
+    "defines": [
+        "DEBUG",
+        "__USE_GNU",
+    ],
+}

@@ -11,10 +11,13 @@ all: clean build_dir server
 build_dir:
 	mkdir -p $(BUILD_DIR)
 
-server: src/server.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $(DEFINE) -o $(BUILD_DIR)/server $(SRC_DIR)/server.c
+# %.o: %.c
+# 	$(CC) $(CFLAGS) $(DEFINE) -c -o $@ $<
+
+server: $(SRC_DIR)/server.c
+	$(CC) $(CFLAGS) $(DEFINE) -o $(BUILD_DIR)/$@ $< $(LDFLAGS)
 
 .PHONY: clean
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) && rm -f $(SRC_DIR)/*.o

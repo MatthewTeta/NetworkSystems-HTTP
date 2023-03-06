@@ -137,7 +137,7 @@ int http_send_response(int connectionfd, char *body, size_t body_len,
                        http_version_t version, http_status_code_t status,
                        http_content_type_t content_type,
                        int                 connection_keep_alive) {
-    if (connectionfd < 1 || body == NULL || body_len > MAX_FILE_SIZE) {
+    if (connectionfd < 1 || body_len > MAX_FILE_SIZE) {
         return -1;
     }
     if (version == HTTP_VERSION_INVALID || status == HTTP_STATUS_INVALID ||
@@ -150,22 +150,25 @@ int http_send_response(int connectionfd, char *body, size_t body_len,
     sprintf(response_packet, "%s %d %s\r\n", HTTP_VERSIONS_SUPPORTED[version],
             status, HTTP_STATUS_CODES[status]);
     // TODO: Write the Content-Type header
-    // TODO: Write the Content-Length header
+    // Write the Content-Length header
+    sprintf(response_packet + strlen(response_packet),
+            "Content-Length: %lu\r\n", body_len);
     // Write the Connection header
     if (connection_keep_alive) {
-        sprintf(response_packet, "Connection: keep-alive\r\n");
+        strcat(response_packet, "Connection: keep-alive\r\n");
     } else {
-        sprintf(response_packet, "Connection: close\r\n");
+        strcat(response_packet, "Connection: close\r\n");
     }
     // Write a blank line to end the header
-    sprintf(response_packet, "\r\n");
+    strcat(response_packet, "\r\n");
     // Write the body
     size_t response_len = strlen(response_packet);
-    if (status == HTTP_STATUS_OK) {
-        memcpy(response_packet, body, body_len);
+    if (status == HTTP_STATUS_OK && body_len > 0 && body) {
+        memcpy(response_packet + response_len, body, body_len);
     }
     response_len += body_len;
     // Send the response
+    printf("Sending response:\n%s", response_packet);
     return send(connectionfd, response_packet, response_len, 0);
 }
 
@@ -406,19 +409,25 @@ int main(int argc, char *argv[]) {
         FILE *file = fopen(file_path, "r");
         printf("File path: %s\n", file_path);
         printf("File: %p\n", file);
-        if (file == NULL) {
+        DIR *dir = NULL;
+        if (file == NULL || (dir = opendir(file_path)) != NULL) {
+            if (dir != NULL) {
+                printf("DIR: %p\n", dir);
+                closedir(dir);
+            }
             // File does not exist
             // Check if the path is a directory
-            // Append a trailing slash if it is not already present
+            // Add a trailing slash if it is not already present
             if (file_path[strlen(file_path) - 1] != PATH_SEPARATOR[0]) {
                 strncat(file_path, PATH_SEPARATOR, MAX_PATH_SIZE - strlen(file_path) - 1);
+                // break;
             }
             // Search for an index file
             char index_path[MAX_PATH_SIZE];
             printf("SIZEOF: %lu\n", sizeof(PATH_FILE_NAME_DEFAULTS));
-            for (size_t i; i < sizeof(PATH_FILE_NAME_DEFAULTS); i++) {
-                printf("Trying %s%s\n", file_path, PATH_FILE_NAME_DEFAULTS[i]);
-                for (size_t j; j < sizeof(HTTP_CONTENT_TYPES_EXT); j++) {
+            printf("SIZEOF: %lu\n", sizeof(HTTP_CONTENT_TYPES_EXT));
+            for (size_t i = 0; i < sizeof(PATH_FILE_NAME_DEFAULTS) / sizeof(char *); i++) {
+                for (size_t j = 0; j < sizeof(HTTP_CONTENT_TYPES_EXT) / sizeof(struct ext_content_type); j++) {
                     memset(index_path, 0, MAX_PATH_SIZE);
                     snprintf(index_path, MAX_PATH_SIZE, "%s%s%s", file_path,
                              PATH_FILE_NAME_DEFAULTS[i],
@@ -452,6 +461,8 @@ int main(int argc, char *argv[]) {
         size_t file_size = fread(file_buffer, 1, MAX_FILE_SIZE, file);
         if (file_size == 0) {
             error(-1, "Error reading file %s\n", file_path);
+            // For some reason directories are being read as files
+            // 
         }
         fclose(file);
         // Generate the response
@@ -466,6 +477,7 @@ int main(int argc, char *argv[]) {
         if (!connection_keep_alive) {
             break;
         }
+        // break;
     }
 
     // Close the connection

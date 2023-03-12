@@ -8,11 +8,11 @@
 #define HTTP_DEBUG_H
 
 #ifdef DEBUG
-#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#define DEBUG_PRINT(...) printf(__VA_ARGS__);
 #else
 #define DEBUG_PRINT(...) do {} while (0)
 #endif
 
-
+#define PRINT_ERROR() fprintf(stderr, "Error at line %d in file %s\n", __LINE__, __FILE__)
 
 #endif

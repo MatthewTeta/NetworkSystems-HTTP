@@ -8,6 +8,7 @@
  * will (ideally) support the "connection: keep-alive"
  */
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <netdb.h>
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -30,10 +32,9 @@
 #define PATH_STATIC_FILES "www"
 #define MAX_PATH_SIZE     1024
 #define BACKLOG           10
-#define MAX_REQ_SIZE      1024
-#define MAX_HEADER_LINES  100
-#define MAX_FILE_SIZE     1024
-#define MAX_HEADER_SIZE   1024
+#define MAX_REQ_SIZE      8192
+#define MAX_HEADER_LINES  4096
+#define MAX_HEADER_SIZE   8192
 #define MAX_RES_SIZE      MAX_HEADER_SIZE + MAX_FILE_SIZE
 
 // PATH FILE NAME DEFAULTS  - the names of files to search for if a directory is
@@ -41,7 +42,7 @@
 char *PATH_FILE_NAME_DEFAULTS[] = {"index"};
 
 typedef enum { HTTP_METHOD_INVALID = -1, HTTP_METHOD_GET = 0 } http_method;
-char *HTTP_METHODS_SUPPORTED[] = {"GET"};
+char *HTTP_METHODS_SUPPORTED[] = {"get"};
 
 typedef enum {
     HTTP_STATUS_INVALID               = -1,
@@ -80,7 +81,7 @@ typedef enum {
     HTTP_VERSION_1_0     = 0,
     HTTP_VERSION_1_1     = 1
 } http_version_t;
-char *HTTP_VERSIONS_SUPPORTED[] = {"HTTP/1.0", "HTTP/1.1"};
+char *HTTP_VERSIONS_SUPPORTED[] = {"http/1.0", "http/1.1"};
 
 struct ext_content_type {
     char               *ext;
@@ -96,10 +97,11 @@ struct ext_content_type HTTP_CONTENT_TYPES_EXT[] = {
 http_method         http_get_method(char *method);
 http_version_t      http_get_version(char *version);
 http_content_type_t http_get_content_type(char *file_name);
-int http_send_response(int connectionfd, char *body, size_t body_size,
-                       http_version_t version, http_status_code_t status,
+int http_send_response(int connectionfd, FILE *infp, http_version_t version,
+                       http_status_code_t  status,
                        http_content_type_t content_type,
                        int                 connection_keep_alive);
+int http_send_bad_request(int connectionfd, http_version_t version);
 
 http_method http_get_method(char *method) {
     for (int i = 0; i < (int)sizeof(HTTP_METHODS_SUPPORTED); i++) {
@@ -133,43 +135,77 @@ http_content_type_t http_get_content_type(char *file_name) {
     return HTTP_CONTENT_TYPE_INVALID;
 }
 
-int http_send_response(int connectionfd, char *body, size_t body_len,
-                       http_version_t version, http_status_code_t status,
+int http_send_response(int connectionfd, FILE *infp, http_version_t version,
+                       http_status_code_t  status,
                        http_content_type_t content_type,
                        int                 connection_keep_alive) {
-    if (connectionfd < 1 || body_len > MAX_FILE_SIZE) {
+    if (connectionfd < 1) {
         return -1;
     }
     if (version == HTTP_VERSION_INVALID || status == HTTP_STATUS_INVALID ||
         content_type == HTTP_CONTENT_TYPE_INVALID) {
-        return -1;
+        return -2;
     }
-    static char response_packet[MAX_RES_SIZE];
-    memset(response_packet, 0, MAX_RES_SIZE);
+    static char response_packet[MAX_HEADER_SIZE];
+    memset(response_packet, 0, MAX_HEADER_SIZE);
     // Write the status line
     sprintf(response_packet, "%s %d %s\r\n", HTTP_VERSIONS_SUPPORTED[version],
             status, HTTP_STATUS_CODES[status]);
     // TODO: Write the Content-Type header
-    // Write the Content-Length header
-    sprintf(response_packet + strlen(response_packet),
-            "Content-Length: %lu\r\n", body_len);
     // Write the Connection header
     if (connection_keep_alive) {
         strcat(response_packet, "Connection: keep-alive\r\n");
     } else {
         strcat(response_packet, "Connection: close\r\n");
     }
+    // Write the Content-Length header
+    // Get the length of the file from the file descriptor
+    size_t body_len = 0;
+    if (infp != NULL) {
+        fseek(infp, 0, SEEK_END);
+        body_len = ftell(infp);
+        fseek(infp, 0, SEEK_SET);
+        sprintf(response_packet + strlen(response_packet),
+                "Content-Length: %lu\r\n", body_len);
+    }
     // Write a blank line to end the header
     strcat(response_packet, "\r\n");
     // Write the body
     size_t response_len = strlen(response_packet);
-    if (status == HTTP_STATUS_OK && body_len > 0 && body) {
-        memcpy(response_packet + response_len, body, body_len);
-    }
-    response_len += body_len;
+    size_t bytes_sent   = 0;
     // Send the response
     printf("Sending response:\n%s", response_packet);
-    return send(connectionfd, response_packet, response_len, 0);
+    // Send the header
+    while (bytes_sent < response_len) {
+        ssize_t rv = send(connectionfd, response_packet + bytes_sent,
+                          response_len - bytes_sent, 0);
+        if (rv < 0) {
+            return -3;
+        }
+        bytes_sent += (size_t)rv;
+    }
+    // Send the file body
+    if (infp != NULL) {
+        int infd = fileno(infp);
+        off_t offset = 0;
+        printf("Sending file body (fd: %d, len: %lu)\r\n", infd, body_len);
+        bytes_sent = 0;
+        while (bytes_sent < body_len) {
+            DEBUG_PRINT("Sending %lu bytes\r\n", body_len - bytes_sent);
+            int rv = sendfile(connectionfd, infd, &offset, body_len - bytes_sent);
+            DEBUG_PRINT("sendfile returned %d\r\n", rv);
+            if (rv < 0) {
+                return -4;
+            }
+            bytes_sent += (size_t)rv;
+        }
+    }
+    return 0;
+}
+
+int http_send_bad_request(int connectionfd, http_version_t version) {
+    return http_send_response(connectionfd, 0, version, HTTP_STATUS_BAD_REQUEST,
+                              HTTP_CONTENT_TYPE_TEXT, 0);
 }
 
 void error(int code, char *format, ...) {
@@ -214,6 +250,12 @@ int split(char *buffer, char **lines, int max_lines, char *delimiter) {
         i++;
     }
     return i;
+}
+
+void strtolower(char *str) {
+    for (size_t i = 0; i < strlen(str); i++) {
+        str[i] = tolower(str[i]);
+    }
 }
 
 void printUsage(char *prog_name) {
@@ -309,8 +351,7 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_storage client_addr;
     socklen_t               client_addr_len;
-    char                    buffer[MAX_REQ_SIZE];
-    int                     nread;
+    char                    header[MAX_REQ_SIZE];
     // while (1) {
     // Await connection
     client_addr_len = sizeof(client_addr);
@@ -325,26 +366,61 @@ int main(int argc, char *argv[]) {
     while (1) {
         // Read the request
         // This should be in a loop to handle partial reads
-        if ((nread = recv(connection, buffer, sizeof(buffer), 0)) < 0) {
-            perror("recv() failed");
-            error(-1, "Error receiving data from client.\n");
+        int    received_header = 0;
+        ssize_t nread;
+        size_t header_len = 0;
+        while (!received_header && header_len < MAX_REQ_SIZE) {
+            if ((nread = recv(connection, header + header_len,
+                              MAX_REQ_SIZE - header_len - 1, 0)) < 0) {
+                perror("recv() failed");
+                error(-1, "Error receiving data from client.\n");
+            }
+            // Have we reached the end of the request?
+            if (nread == 0) {
+                // The connection has been closed
+                break;
+            }
+            header_len += nread;
+            // Loop through the buffer and check for the end of the header
+            // \r\n\r\n
+            size_t i;
+            for (i = 0; i < header_len - 3; i++) {
+                // Check for the end of the header
+                if (header[i] == '\r' && header[i + 1] == '\n' &&
+                    header[i + 2] == '\r' && header[i + 3] == '\n') {
+                    received_header = 1;
+                    // If we were handling a body then we would rearrange the
+                    // memory here Null terminate the header buffer
+                    if (i + 4 < MAX_REQ_SIZE) {
+                        memset(header + i + 4, 0, MAX_REQ_SIZE - i - 4);
+                    } else {
+                        header[MAX_REQ_SIZE - 1] = '\0';
+                    }
+                }
+            }
+            // Parse the request
+            printf("Received %ld bytes:\n%s\n", nread, header);
+            // The request should be in the form:
+            // GET /path/to/file HTTP/<version>\r\n
+            // <headers>\r\n
+            // \r\n
+            // <body>
+            // Parse the request line
+            // Split the string based on \r
         }
-        // Have we reached the end of the request?
+        // Check for header too long
+        if (header_len > MAX_REQ_SIZE) {
+            http_send_bad_request(connection, HTTP_VERSION_1_1);
+            error(-1, "Header too long.\n");
+        }
+        // Check for connection closed
         if (nread == 0) {
-            // The connection has been closed
             break;
         }
-        // Parse the request
-        printf("Received %d bytes:\n%s\n", nread, buffer);
-        // The request should be in the form:
-        // GET /path/to/file HTTP/<version>\r\n
-        // <headers>\r\n
-        // \r\n
-        // <body>
         // Parse the request line
         // Split the string based on \r\n delimiters
         char *lines[MAX_HEADER_LINES];
-        if (split(buffer, lines, MAX_HEADER_LINES, "\r\n") ==
+        if (split(header, lines, MAX_HEADER_LINES, "\r\n") ==
             MAX_HEADER_LINES) {
             error(-1, "Error parsing request. Too many lines in request\n");
         }
@@ -353,49 +429,56 @@ int main(int argc, char *argv[]) {
         // Split the request line based on spaces
         char *tokens[3];
         if (split(request_line, tokens, 3, " ") != 3) {
+            http_send_bad_request(connection, HTTP_VERSION_1_1);
             error(-1, "Error parsing request line.\n");
         }
         char *method  = tokens[0];
         char *path    = tokens[1];
         char *version = tokens[2];
+        strtolower(method);
+        strtolower(version);
         printf("Method: %s\n", method);
         printf("Path: %s\n", path);
         printf("Version: %s\n", version);
         // TODO: Respond with 400 Bad Request if the request line is invalid
         // Check the method
         if (HTTP_METHOD_INVALID == http_get_method(method)) {
+            http_send_bad_request(connection, HTTP_VERSION_1_1);
             error(-1, "Error parsing request. Invalid method.\n");
         }
         // Check the version
         http_version_t http_version = http_get_version(version);
         if (HTTP_VERSION_INVALID == http_version) {
+            http_send_bad_request(connection, HTTP_VERSION_1_1);
             error(-1, "Error parsing request. Invalid version.\n");
         }
         // Search for the connection header and determine where the body
-        // starts
-        int    connection_keep_alive = 0;
-        char **body_start            = NULL;
+        // starts (now I deleted the body above)
+        int connection_keep_alive = 0;
+        // char **body_start            = NULL;
         for (int i = 1; i < MAX_HEADER_LINES; i++) {
             if (lines[i] == NULL)
                 break;
             char *header = lines[i];
+            // Cast everything to lowercase
+            strtolower(header);
             if (strncmp(header, "\r\n", 2) == 0) {
                 // The body starts after the empty line
-                if (i + 1 < MAX_HEADER_LINES) {
-                    body_start = &lines[i + 1];
-                }
+                // if (i + 1 < MAX_HEADER_LINES) {
+                //     body_start = &lines[i + 1];
+                // }
                 // Replace the empty line with a null terminator
                 lines[i] = NULL;
                 break;
             }
-            if (strncmp(header, "Connection: keep-alive", 22) == 0) {
+            if (strncmp(header, "connection: keep-alive", 22) == 0) {
                 connection_keep_alive = 1;
                 break;
             }
         }
-        if (body_start == NULL) {
-            printf("No body\n");
-        }
+        // if (body_start == NULL) {
+        //     printf("No body\n");
+        // }
         if (connection_keep_alive) {
             printf("Connection keep-alive\n");
         }
@@ -403,14 +486,15 @@ int main(int argc, char *argv[]) {
         // Determine the file to serve
         // Concatenate the base path with the requested path
         char file_path[MAX_PATH_SIZE];
+        char *final_path = file_path;
         memset(file_path, 0, MAX_PATH_SIZE);
         snprintf(file_path, MAX_PATH_SIZE, "%s%s", PATH_STATIC_FILES, path);
         // Attempt to open the file
         FILE *file = fopen(file_path, "r");
         printf("File path: %s\n", file_path);
         printf("File: %p\n", file);
-        DIR *dir = NULL;
-        if (file == NULL || (dir = opendir(file_path)) != NULL) {
+        DIR *dir = opendir(file_path);
+        if (file == NULL || dir != NULL) {
             if (dir != NULL) {
                 printf("DIR: %p\n", dir);
                 closedir(dir);
@@ -419,15 +503,17 @@ int main(int argc, char *argv[]) {
             // Check if the path is a directory
             // Add a trailing slash if it is not already present
             if (file_path[strlen(file_path) - 1] != PATH_SEPARATOR[0]) {
-                strncat(file_path, PATH_SEPARATOR, MAX_PATH_SIZE - strlen(file_path) - 1);
+                strncat(file_path, PATH_SEPARATOR,
+                        MAX_PATH_SIZE - strlen(file_path) - 1);
                 // break;
             }
             // Search for an index file
             char index_path[MAX_PATH_SIZE];
-            printf("SIZEOF: %lu\n", sizeof(PATH_FILE_NAME_DEFAULTS));
-            printf("SIZEOF: %lu\n", sizeof(HTTP_CONTENT_TYPES_EXT));
-            for (size_t i = 0; i < sizeof(PATH_FILE_NAME_DEFAULTS) / sizeof(char *); i++) {
-                for (size_t j = 0; j < sizeof(HTTP_CONTENT_TYPES_EXT) / sizeof(struct ext_content_type); j++) {
+            for (size_t i = 0;
+                 i < sizeof(PATH_FILE_NAME_DEFAULTS) / sizeof(char *); i++) {
+                for (size_t j = 0; j < sizeof(HTTP_CONTENT_TYPES_EXT) /
+                                           sizeof(struct ext_content_type);
+                     j++) {
                     memset(index_path, 0, MAX_PATH_SIZE);
                     snprintf(index_path, MAX_PATH_SIZE, "%s%s%s", file_path,
                              PATH_FILE_NAME_DEFAULTS[i],
@@ -436,20 +522,21 @@ int main(int argc, char *argv[]) {
                     file = fopen(index_path, "r");
                     if (file != NULL) {
                         // Found an index file
+                        final_path = index_path;
                         goto file_found;
                     }
                 }
             }
         }
-        file_found:
+    file_found:
         if (file == NULL) {
             // File does not exist
             // Generate a 404 response
             rv = http_send_response(
-                connection, NULL, 0, http_version, HTTP_STATUS_NOT_FOUND,
+                connection, 0, http_version, HTTP_STATUS_NOT_FOUND,
                 HTTP_CONTENT_TYPE_TEXT, connection_keep_alive);
             if (rv < 0) {
-                error(-1, "Error sending response.\n");
+                error(-1, "Error sending response. (1) %d\n", rv);
             }
             // Send the response
             // Close the connection if the request is not keep-alive
@@ -457,22 +544,22 @@ int main(int argc, char *argv[]) {
             // error(-1, "Error opening file %s\n", file_path);
         }
         // Read the file
-        char   file_buffer[MAX_FILE_SIZE];
-        size_t file_size = fread(file_buffer, 1, MAX_FILE_SIZE, file);
-        if (file_size == 0) {
-            error(-1, "Error reading file %s\n", file_path);
-            // For some reason directories are being read as files
-            // 
-        }
-        fclose(file);
+        // char   file_buffer[MAX_FILE_SIZE];
+        // size_t file_size = fread(file_buffer, 1, MAX_FILE_SIZE, file);
+        // if (file_size == 0) {
+        //     error(-1, "Error reading file %s\n", file_path);
+        //     // For some reason directories are being read as files
+        //     //
+        // }
         // Generate the response
         // Send the response
-        rv = http_send_response(
-            connection, file_buffer, file_size, http_version, HTTP_STATUS_OK,
-            http_get_content_type(file_path), connection_keep_alive);
+        rv = http_send_response(connection, file, http_version, HTTP_STATUS_OK,
+                                http_get_content_type(final_path),
+                                connection_keep_alive);
         if (rv < 0) {
-            error(-1, "Error sending response.\n");
+            error(-1, "Error sending response. (2) %d\n", rv);
         }
+        fclose(file);
         // Close the connection if the request is not keep-alive
         if (!connection_keep_alive) {
             break;

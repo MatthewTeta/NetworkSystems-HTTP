@@ -1,10 +1,10 @@
 # Path: NetworkSystems-HTTP/Makefile
 CC = gcc
-CFLAGS = -Wall -Wextra -O0 -g
-LDFLAGS = -lpthread
+CFLAGS = -Wall -Wextra -O3
 SRC_DIR = src
 BUILD_DIR = build
-DEFINE = -DDEBUG
+# DEFINE = -DDEBUG
+DEFINE =
 
 all: clean build_dir server
 
@@ -15,7 +15,7 @@ build_dir:
 # 	$(CC) $(CFLAGS) $(DEFINE) -c -o $@ $<
 
 server: $(SRC_DIR)/server.c
-	$(CC) $(CFLAGS) $(DEFINE) -o $(BUILD_DIR)/$@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(DEFINE) -o $(BUILD_DIR)/$@ $<
 
 .PHONY: clean
 

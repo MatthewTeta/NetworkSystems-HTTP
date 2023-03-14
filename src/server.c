@@ -41,9 +41,10 @@
 #define MAX_ARB_BODY_SIZE 1024
 #define KEEP_ALIVE_TIMEOUT_MS 10000
 
-static int server_socket = -1;
-static int client_connection = -1;
+static int server_socketfd = -1;
+static int client_connectionfd = -1;
 static int parent_process = 1;
+static int child_exit = 0;
 
 double get_elapsed_time(struct timeval start, struct timeval end)
 {
@@ -53,11 +54,11 @@ double get_elapsed_time(struct timeval start, struct timeval end)
 
 void close_connection()
 {
-    if (client_connection != -1)
+    if (client_connectionfd != -1)
     {
         // Close the client socket
-        close(client_connection);
-        client_connection = -1;
+        close(client_connectionfd);
+        client_connectionfd = -1;
     }
     // If this is a child process, exit
     if (!parent_process)
@@ -116,6 +117,13 @@ char *HTTP_CONTENT_TYPES[] = {"text/html", "text/plain", "image/png",
                               "image/gif", "image/jpeg", "text/css",
                               "text/javascript"};
 
+struct ext_content_type
+{
+    char *ext;
+    http_content_type_t type;
+} HTTP_CONTENT_TYPES_EXT[] = {
+    {".htm", HTTP_CONTENT_TYPE_HTML}, {".html", HTTP_CONTENT_TYPE_HTML}, {".txt", HTTP_CONTENT_TYPE_TEXT}, {".png", HTTP_CONTENT_TYPE_PNG}, {".gif", HTTP_CONTENT_TYPE_GIF}, {".jpg", HTTP_CONTENT_TYPE_JPG}, {".css", HTTP_CONTENT_TYPE_CSS}, {".js", HTTP_CONTENT_TYPE_JS}};
+
 typedef enum
 {
     HTTP_VERSION_INVALID = -1,
@@ -123,13 +131,6 @@ typedef enum
     HTTP_VERSION_1_1 = 1
 } http_version_t;
 char *HTTP_VERSIONS_SUPPORTED[] = {"HTTP/1.0", "HTTP/1.1"};
-
-struct ext_content_type
-{
-    char *ext;
-    http_content_type_t type;
-} HTTP_CONTENT_TYPES_EXT[] = {
-    {".htm", HTTP_CONTENT_TYPE_HTML}, {".html", HTTP_CONTENT_TYPE_HTML}, {".txt", HTTP_CONTENT_TYPE_TEXT}, {".png", HTTP_CONTENT_TYPE_PNG}, {".gif", HTTP_CONTENT_TYPE_GIF}, {".jpg", HTTP_CONTENT_TYPE_JPG}, {".css", HTTP_CONTENT_TYPE_CSS}, {".js", HTTP_CONTENT_TYPE_JS}};
 
 http_method http_get_method(char *method);
 http_version_t http_get_version(char *version);
@@ -315,7 +316,11 @@ int http_send_bad_request(int connectionfd, http_version_t version, struct timev
     va_end(args);
     int rv = http_send_response(connectionfd, error_message, NULL, version, HTTP_STATUS_BAD_REQUEST,
                                 HTTP_CONTENT_TYPE_TEXT, 0, start_time);
+    // Close the connection and exit the client
+    close(client_connectionfd);
+    fprintf(stderr, "Bad request -- %s\n", error_message);
     free(error_message);
+    exit(-1);
     return rv;
 }
 
@@ -323,27 +328,25 @@ int http_send_bad_request(int connectionfd, http_version_t version, struct timev
 typedef struct pid_list
 {
     pid_t pid;
-    int fd;
     struct pid_list *next;
 } pid_list_t;
 
-pid_list_t *pid_list_create(pid_t pid, int fd)
+pid_list_t *pid_list_create(pid_t pid)
 {
     pid_list_t *list = malloc(sizeof(pid_list_t));
     list->pid = pid;
-    list->fd = fd;
     list->next = NULL;
     return list;
 }
 
-void pid_list_append(pid_list_t *list, pid_t pid, int fd)
+void pid_list_append(pid_list_t *list, pid_t pid)
 {
     if (list == NULL)
     {
         DEBUG_PRINT("Cannot append to NULL list\n");
         return;
     }
-    pid_list_t *new_node = pid_list_create(pid, fd);
+    pid_list_t *new_node = pid_list_create(pid);
     pid_list_t *current = list;
     while (current->next != NULL)
     {
@@ -372,7 +375,7 @@ pid_list_t *pid_list_remove(pid_list_t *list, pid_t pid)
                 pid_list_t *next = current->next;
                 free(current);
                 current = next;
-                return next;
+                return current;
             }
             else
             {
@@ -380,7 +383,6 @@ pid_list_t *pid_list_remove(pid_list_t *list, pid_t pid)
                 DEBUG_PRINT("Removing node in the middle\n");
                 prev->next = current->next;
                 free(current);
-                current = prev->next;
                 return list;
             }
         }
@@ -418,7 +420,6 @@ void pid_list_print(pid_list_t *list)
 
 void error(int code, char *format, ...)
 {
-    // fprintf(stderr, __VA_ARGS__);
     // Print the variadic args to stderr before exiting with code
     va_list argp;
     va_start(argp, format);
@@ -436,32 +437,37 @@ void sig_handler(int sig)
 {
     if (sig == SIGINT)
     {
-        // Close the server socket
-        if (server_socket != -1)
-        {
-            close(server_socket);
-        }
         // Kill all child processes
         if (parent_process)
         {
-            pid_list_print(child_pids);
+            // Close the listening socket and tell all child processes to exit
+            close(server_socketfd);
+            // Mask the SIGCHLD signal so that it doesn't interrupt the waitpid call
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            sigprocmask(SIG_BLOCK, &mask, NULL);
             pid_list_t *current = child_pids;
             while (current != NULL)
             {
+                // KILL ALL THE CHILDREN
                 kill(current->pid, SIGINT);
                 current = current->next;
             }
             // Loop through the child pids and wait for them to exit
+            printf("\nWaiting for child processes to exit gracefully...\n");
             current = child_pids;
             while (current != NULL)
             {
                 int status;
+                // REAP ALL THE CHILDREN
                 waitpid(current->pid, &status, 0);
                 current = current->next;
             }
-            pid_list_print(child_pids);
             // Free the child pid list
             pid_list_free(child_pids);
+            // Finally exit the parent process
+            printf("Done\n");
             exit(0);
         }
         else
@@ -474,16 +480,15 @@ void sig_handler(int sig)
     {
         if (parent_process)
         {
+            DEBUG_PRINT("SIGCHLD received\n");
             // A child process has exited
-            pid_list_print(child_pids);
             int status;
-            pid_t pid = waitpid(-1, &status, WNOHANG);
+            pid_t pid = waitpid(-1, &status, 0);
             if (pid > 0)
             {
                 DEBUG_PRINT("Child process %d exited with status %d\n", pid, status);
                 // Remove the pid from the list of child pids
                 child_pids = pid_list_remove(child_pids, pid);
-                pid_list_print(child_pids);
             }
         }
     }
@@ -567,7 +572,7 @@ int main(int argc, char *argv[])
     // Append the static server directory to the path
     strcat(path, "/");
     strcat(path, PATH_STATIC_FILES);
-    DEBUG_PRINT("Serving files out of static path: %s\n", path);
+    printf("Serving files on port %s out of static path: %s\n", port, path);
     // Check if the directory exists and exit if not
     DIR *dir = opendir(path);
     if (dir)
@@ -604,8 +609,8 @@ int main(int argc, char *argv[])
     }
 
     // Open a socket file descriptor and await connections
-    server_socket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (server_socket < 0)
+    server_socketfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (server_socketfd < 0)
     {
         perror("socket() failed");
         error(-1, "Error opening socket.\n");
@@ -618,19 +623,20 @@ int main(int argc, char *argv[])
      * Eliminates "ERROR on binding: Address already in use" error.
      */
     int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
+    setsockopt(server_socketfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
                sizeof(int));
 #endif
 
-    rv = bind(server_socket, res->ai_addr, res->ai_addrlen);
+    rv = bind(server_socketfd, res->ai_addr, res->ai_addrlen);
     if (rv < 0)
     {
         perror("bind() failed");
         error(-1, "Error binding socket to port %s\n", port);
     }
+    freeaddrinfo(res);
 
     // Begin listening for connections
-    if (listen(server_socket, BACKLOG) < 0)
+    if (listen(server_socketfd, BACKLOG) < 0)
     {
         perror("listen() failed");
         error(-1, "Error listening on socket.\n");
@@ -658,9 +664,13 @@ int main(int argc, char *argv[])
         socklen_t client_addr_len;
         // Await connection
         client_addr_len = sizeof(client_addr);
-        client_connection =
-            accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-        // Print who has connected
+        client_connectionfd =
+            accept(server_socketfd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (client_connectionfd < 0)
+        {
+            perror("accept() failed");
+            continue;
+        }
         // Fork into a new process to handle the connection
         pid_t pid = fork();
         if (pid < 0)
@@ -675,11 +685,11 @@ int main(int argc, char *argv[])
             // Append the child process to the list of child processes
             if (child_pids == NULL)
             {
-                child_pids = pid_list_create(pid, client_connection);
+                child_pids = pid_list_create(pid);
             }
             else
             {
-                pid_list_append(child_pids, pid, client_connection);
+                pid_list_append(child_pids, pid);
             }
             // This bit is run in the parent process to accept new connections
             // Close the connection file descriptor in the parent process
@@ -690,9 +700,8 @@ int main(int argc, char *argv[])
             // Child process
             // Close the server socket file descriptor in the child process
             parent_process = 0;
-            close(server_socket);
-            server_socket = -1;
-            DEBUG_PRINT("Closed server socket file descriptor in child process\n");
+            close(server_socketfd);
+            server_socketfd = -1;
             // Get the client's address
             char *hostaddrp;
             struct hostent *hostp;
@@ -707,23 +716,18 @@ int main(int argc, char *argv[])
             {
                 error(-3, "ERROR on inet_ntoa\n");
             }
+            // Print who has connected
             printf("Established connectiong with %s (%s)\n", hostp->h_name, hostaddrp);
             // This bit is run in the child process to handle the connection
             char header[MAX_REQ_SIZE + 1]; // +1 for null terminator
             // Get the time the connection was accepted
             struct timeval time_accept;
             gettimeofday(&time_accept, NULL);
-            // if connection:
-            if (client_connection < 0)
-            {
-                perror("accept() failed");
-                error(-1, "Error accepting connection.\n");
-            }
             // Handle the connection
             while (!child_exit)
             {
                 // Read the request
-                // This should be in a loop to handle partial reads
+                memset(header, 0, MAX_REQ_SIZE + 1);
                 int received_header = 0;
                 ssize_t nread = 0;
                 size_t header_len = 0;
@@ -734,15 +738,21 @@ int main(int argc, char *argv[])
                     // Poll the socket for data until we get something or a timeout is recieved
                     short revents = 0;
                     struct pollfd fds = {
-                        .fd = client_connection,
+                        .fd = client_connectionfd,
                         .events = POLLIN,
                         .revents = revents,
                     };
                     int rv = poll(&fds, 1, KEEP_ALIVE_TIMEOUT_MS);
                     if (rv < 0)
                     {
-                        perror("Error while polling connection");
-                        error(-1, "Error polling socket.\n");
+                        // This will fail if the parent recieves a SIGINT
+                        // This is fine, check if nread is 0 to see if we have received any data
+                        // If we have received data, continue processing the request
+                        // If we have not received any data, exit the child process
+                        if (nread)
+                            break;
+                        DEBUG_PRINT("Poll failed, exiting child process\n");
+                        close_connection();
                     }
                     else if (rv == 0)
                     {
@@ -752,9 +762,12 @@ int main(int argc, char *argv[])
                     // We got data before the timeout, read it
                     if (nread == 0)
                     {
+                        // Beginning of new header, get the time the header was received
+                        // This is used to calculate the time it took to receive the header
+                        // and send the response
                         gettimeofday(&time_recv, NULL);
                     }
-                    if ((nread = recv(client_connection, header + header_len,
+                    if ((nread = recv(client_connectionfd, header + header_len,
                                       MAX_REQ_SIZE - header_len, 0)) < 0)
                     {
                         perror("recv() failed");
@@ -762,7 +775,7 @@ int main(int argc, char *argv[])
                     }
                     if (nread == 0)
                     {
-                        // The connection has been closed
+                        // The connection has been closed by the client
                         close_connection();
                     }
                     header_len += nread;
@@ -801,7 +814,7 @@ int main(int argc, char *argv[])
                 // Check for header too long
                 if (!received_header && header_len == MAX_REQ_SIZE)
                 {
-                    http_send_bad_request(client_connection, HTTP_VERSION_1_1, time_recv, "Header too long: Maximum Header length is %d bytes\n", MAX_REQ_SIZE);
+                    http_send_bad_request(client_connectionfd, HTTP_VERSION_1_1, time_recv, "Header too long: Maximum Header length is %d bytes\n", MAX_REQ_SIZE);
                     printf("Error parsing request. Header too long.\n");
                     close_connection();
                 }
@@ -817,8 +830,7 @@ int main(int argc, char *argv[])
                 if (split(header, lines, MAX_HEADER_LINES, "\r\n") ==
                     MAX_HEADER_LINES)
                 {
-                    http_send_bad_request(client_connection, HTTP_VERSION_1_1, time_recv, "Invalid request: Too many lines in request header\n");
-                    error(-1, "Error parsing request. Too many lines in request\n");
+                    http_send_bad_request(client_connectionfd, HTTP_VERSION_1_1, time_recv, "Invalid request: Too many lines in request header\n");
                 }
                 char *request_line = lines[0];
                 // Parse the headers
@@ -826,30 +838,24 @@ int main(int argc, char *argv[])
                 char *tokens[3];
                 if (split(request_line, tokens, 3, " ") != 3)
                 {
-                    http_send_bad_request(client_connection, HTTP_VERSION_1_1, time_recv, "Invalid request line: %s\n", request_line);
-                    error(-1, "Error parsing request line.\n");
+                    http_send_bad_request(client_connectionfd, HTTP_VERSION_1_1, time_recv, "Invalid request line: %s\n", request_line);
                 }
                 char *method = tokens[0];
                 char *path = tokens[1];
                 char *version = tokens[2];
                 strtoupper(method);
                 strtoupper(version);
-                DEBUG_PRINT("Method: %s\n", method);
-                DEBUG_PRINT("Path: %s\n", path);
-                DEBUG_PRINT("Version: %s\n", version);
-                // TODO: Respond with 400 Bad Request if the request line is invalid
+                printf("Method: %s\tPATH: %s\tVERSION: %s\n", method, path, version);
                 // Check the method
                 if (HTTP_METHOD_INVALID == http_get_method(method))
                 {
-                    http_send_bad_request(client_connection, HTTP_VERSION_1_1, time_recv, "Invalid method: %s\n", method);
-                    error(-1, "Error parsing request. Invalid method.\n");
+                    http_send_bad_request(client_connectionfd, HTTP_VERSION_1_1, time_recv, "Invalid method: %s\n", method);
                 }
                 // Check the version
                 http_version_t http_version = http_get_version(version);
                 if (HTTP_VERSION_INVALID == http_version)
                 {
-                    http_send_bad_request(client_connection, HTTP_VERSION_1_1, time_recv, "Invalid version: %s\n", version);
-                    error(-1, "Error parsing request. Invalid version.\n");
+                    http_send_bad_request(client_connectionfd, HTTP_VERSION_1_1, time_recv, "Invalid version: %s\n", version);
                 }
                 // Search for the connection header and determine where the body
                 // starts (now I deleted the body above)
@@ -883,7 +889,7 @@ int main(int argc, char *argv[])
                 // }
                 if (connection_keep_alive)
                 {
-                    DEBUG_PRINT("Connection keep-alive\n");
+                    DEBUG_PRINT("Connection: keep-alive\n");
                 }
                 // No need to parse the body since we only do GET requests
                 // Determine the file to serve
@@ -929,21 +935,22 @@ int main(int argc, char *argv[])
                             {
                                 // Found an index file
                                 final_path = index_path;
-                                goto file_found;
+                                goto file_found_maybe;
                             }
                         }
                     }
                 }
-            file_found:
+            file_found_maybe:
                 if (file == NULL)
                 {
                     // File does not exist
                     // Generate a 404 response
                     rv = http_send_response(
-                        client_connection, "File not found", NULL, http_version, HTTP_STATUS_NOT_FOUND,
+                        client_connectionfd, "File not found", NULL, http_version, HTTP_STATUS_NOT_FOUND,
                         HTTP_CONTENT_TYPE_INVALID, connection_keep_alive, time_recv);
                     if (rv < 0)
                     {
+                        close(client_connectionfd);
                         error(-1, "Error sending response. (1) %d\n", rv);
                     }
                 }
@@ -951,7 +958,7 @@ int main(int argc, char *argv[])
                 {
                     // Generate the response
                     // Send the response
-                    rv = http_send_response(client_connection, NULL, file, http_version, HTTP_STATUS_OK,
+                    rv = http_send_response(client_connectionfd, NULL, file, http_version, HTTP_STATUS_OK,
                                             http_get_content_type(final_path),
                                             connection_keep_alive, time_recv);
                     if (rv < 0)
